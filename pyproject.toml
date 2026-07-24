@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "weather-application"
-version = "0.3.0.dev0"
+version = "0.3.0rc1"
 description = "A multilingual weather client with local history and a secure API proxy."
 readme = "README.md"
 requires-python = ">=3.10"
