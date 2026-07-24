@@ -47,6 +47,13 @@ TRUSTED_TOKENS = set(
     if token.strip()
 )
 
+ADMIN_TOKENS = set(
+    token.strip()
+    for token in os.getenv("ADMIN_TOKENS", "").split(",")
+    if token.strip()
+)
+HISTORY_ENDPOINTS_ENABLED = _env_bool("HISTORY_ENDPOINTS_ENABLED", False)
+
 # Public clients receive conservative limits. A private trusted token gets a
 # larger interactive allowance and can use the quota reserve.
 default_public_rate = "120" if PROXY_MODE == "development" else "10"
@@ -120,6 +127,7 @@ _hits = defaultdict(deque)
 # cache misses so only one request reaches OpenWeatherMap for a location.
 _weather_cache: OrderedDict[str, tuple[float, dict]] = OrderedDict()
 _query_locks: dict[str, asyncio.Lock] = {}
+_metrics: defaultdict[str, int] = defaultdict(int)
 
 
 def _cache_key(
@@ -365,6 +373,7 @@ def _enforce_rate_limit(key: str, limit: int, window_seconds: int = 60) -> None:
 
     # Checks if the length of q is greater than or equal to the set limit.
     if len(q) >= limit:
+        _metrics["rate_limit_rejections"] += 1
         # Raises an exception for the standard "Too Many Requests." code number, 429.
         retry_after = max(1, int(q[0] + window_seconds - now))
         raise HTTPException(
@@ -380,6 +389,16 @@ def _token_matches(token: str | None, candidates: set[str]) -> bool:
     if not token:
         return False
     return any(hmac.compare_digest(token, candidate) for candidate in candidates)
+
+
+def _require_admin(request: Request) -> str:
+    if not ADMIN_TOKENS:
+        raise HTTPException(status_code=404, detail="Not found")
+
+    token = _get_bearer_token(request)
+    if not _token_matches(token, ADMIN_TOKENS):
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    return token
 
 
 """
@@ -400,12 +419,9 @@ async def root():
 # This endpoint uses the same token security rules as /weather.
 @app.get("/history")
 async def history(request: Request, limit: int = 25):
-
-    token = _get_bearer_token(request)
-
-    if PROXY_TOKENS:
-        if not token or token not in PROXY_TOKENS:
-            raise HTTPException(status_code=401, detail="Unauthorized")
+    if not HISTORY_ENDPOINTS_ENABLED:
+        raise HTTPException(status_code=404, detail="Not found")
+    _require_admin(request)
 
     return {"items": _db_fetch_history(limit=limit)}
 
@@ -413,17 +429,45 @@ async def history(request: Request, limit: int = 25):
 # Searches the history DB for city/name/description matches.
 @app.get("/search")
 async def search(request: Request, q: str, limit: int = 25):
-
-    token = _get_bearer_token(request)
-
-    if PROXY_TOKENS:
-        if not token or token not in PROXY_TOKENS:
-            raise HTTPException(status_code=401, detail="Unauthorized")
+    if not HISTORY_ENDPOINTS_ENABLED:
+        raise HTTPException(status_code=404, detail="Not found")
+    _require_admin(request)
 
     if not (q or "").strip():
         raise HTTPException(status_code=400, detail="q is required")
 
     return {"items": _db_search(q=q, limit=limit)}
+
+
+@app.get("/admin/stats")
+async def admin_stats(request: Request):
+    _require_admin(request)
+
+    reserve_multiplier = (100 - RESERVE_PERCENT) / 100
+    return {
+        "mode": PROXY_MODE,
+        "service_enabled": SERVICE_ENABLED,
+        "upstream_calls_enabled": UPSTREAM_CALLS_ENABLED,
+        "cache": {
+            "entries": len(_weather_cache),
+            "max_entries": CACHE_MAX_ENTRIES,
+            "ttl_seconds": CACHE_TTL_SECONDS,
+            "hits": _metrics["cache_hits"],
+            "misses": _metrics["cache_misses"],
+        },
+        "upstream": {
+            "calls": _metrics["upstream_calls"],
+            "successes": _metrics["upstream_successes"],
+            "errors": _metrics["upstream_errors"],
+            "hour_count": _usage_hour_count,
+            "public_hour_limit": max(1, int(HOURLY_LIMIT * reserve_multiplier)),
+            "trusted_hour_limit": HOURLY_LIMIT,
+            "day_count": _usage_count,
+            "public_day_limit": max(1, int(DAILY_LIMIT * reserve_multiplier)),
+            "trusted_day_limit": DAILY_LIMIT,
+        },
+        "rate_limit_rejections": _metrics["rate_limit_rejections"],
+    }
 
 
 # Decorator (function abstraction) for FastAPT to handle GET requests to "/weather".
@@ -437,7 +481,9 @@ async def weather(
     units: str = "metric",
     lang: str = "en",
 ):
+    _metrics["weather_requests"] += 1
     if not SERVICE_ENABLED:
+        _metrics["service_disabled_rejections"] += 1
         raise HTTPException(status_code=503, detail="Weather service is temporarily disabled.")
 
     # Checks if nothing is retrieved for secret key in env vars.
@@ -487,6 +533,7 @@ async def weather(
     key = _cache_key(city=city, postal=postal, country=country, units=units, lang=lang)
     cached = _cache_get(key)
     if cached:
+        _metrics["cache_hits"] += 1
         data, age = cached
         response.headers["X-Weather-Cache"] = "HIT"
         response.headers["X-Weather-Cache-Age"] = str(age)
@@ -497,12 +544,15 @@ async def weather(
         # Another request might have filled the cache while this one waited.
         cached = _cache_get(key)
         if cached:
+            _metrics["cache_hits"] += 1
             data, age = cached
             response.headers["X-Weather-Cache"] = "HIT"
             response.headers["X-Weather-Cache-Age"] = str(age)
             return _weather_payload(data)
 
+        _metrics["cache_misses"] += 1
         if not UPSTREAM_CALLS_ENABLED:
+            _metrics["upstream_disabled_rejections"] += 1
             raise HTTPException(
                 status_code=503,
                 detail="Live weather refreshes are temporarily disabled.",
@@ -516,6 +566,7 @@ async def weather(
             window_seconds=600,
         )
         _enforce_upstream_budget(trusted=trusted)
+        _metrics["upstream_calls"] += 1
 
         params = {
             "appid": OPENWEATHER_API_KEY,
@@ -531,11 +582,14 @@ async def weather(
             async with httpx.AsyncClient(timeout=8) as client_http:
                 upstream_response = await client_http.get(OPENWEATHER_URL, params=params)
         except httpx.TimeoutException as exc:
+            _metrics["upstream_errors"] += 1
             raise HTTPException(status_code=504, detail="Weather provider timed out") from exc
         except httpx.HTTPError as exc:
+            _metrics["upstream_errors"] += 1
             raise HTTPException(status_code=502, detail="Weather provider unavailable") from exc
 
         if upstream_response.status_code != 200:
+            _metrics["upstream_errors"] += 1
             try:
                 detail = upstream_response.json()
             except Exception:
@@ -543,6 +597,7 @@ async def weather(
             raise HTTPException(status_code=upstream_response.status_code, detail=detail)
 
         data = upstream_response.json()
+        _metrics["upstream_successes"] += 1
         _cache_put(key, data)
         _db_log(
             query_type="city" if city else "postal",

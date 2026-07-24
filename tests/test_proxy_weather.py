@@ -46,6 +46,7 @@ def reset_proxy_counters(monkeypatch):
     server._hits.clear()
     server._weather_cache.clear()
     server._query_locks.clear()
+    server._metrics.clear()
     DummyAsyncClient.calls = 0
     monkeypatch.setattr(server, "_usage_hour", None)
     monkeypatch.setattr(server, "_usage_hour_count", 0)
@@ -58,6 +59,8 @@ def reset_proxy_counters(monkeypatch):
     monkeypatch.setattr(server, "TRUSTED_RATE_LIMIT_PER_MIN", 120)
     monkeypatch.setattr(server, "QUERY_RATE_LIMIT_PER_10_MIN", 2)
     monkeypatch.setattr(server, "TRUSTED_TOKENS", set())
+    monkeypatch.setattr(server, "ADMIN_TOKENS", set())
+    monkeypatch.setattr(server, "HISTORY_ENDPOINTS_ENABLED", False)
     monkeypatch.setattr(server, "SERVICE_ENABLED", True)
     monkeypatch.setattr(server, "UPSTREAM_CALLS_ENABLED", True)
     monkeypatch.setattr(server, "CACHE_TTL_SECONDS", 600)
@@ -241,3 +244,50 @@ def test_proxy_maps_upstream_timeout_to_gateway_timeout(monkeypatch):
     client = TestClient(proxy_app)
     response = client.get("/weather?city=London&country=gb")
     assert response.status_code == 504
+
+
+def test_history_endpoints_are_disabled_by_default(monkeypatch):
+    monkeypatch.setattr(server, "ADMIN_TOKENS", {"admin-token"})
+    client = TestClient(proxy_app)
+
+    headers = {"Authorization": "Bearer admin-token"}
+    assert client.get("/history", headers=headers).status_code == 404
+    assert client.get("/search?q=London", headers=headers).status_code == 404
+
+
+def test_history_endpoints_require_admin_token(monkeypatch):
+    monkeypatch.setattr(server, "ADMIN_TOKENS", {"admin-token"})
+    monkeypatch.setattr(server, "HISTORY_ENDPOINTS_ENABLED", True)
+    client = TestClient(proxy_app)
+
+    assert client.get("/history").status_code == 401
+    response = client.get(
+        "/history",
+        headers={"Authorization": "Bearer admin-token"},
+    )
+    assert response.status_code == 200
+    assert response.json() == {"items": []}
+
+
+def test_admin_stats_are_private_and_report_aggregate_usage(monkeypatch):
+    monkeypatch.setattr(server, "OPENWEATHER_API_KEY", "dummykey")
+    monkeypatch.setattr(server, "PROXY_TOKENS", set())
+    monkeypatch.setattr(server, "ADMIN_TOKENS", {"admin-token"})
+    monkeypatch.setattr(server.httpx, "AsyncClient", DummyAsyncClient)
+    client = TestClient(proxy_app)
+
+    assert client.get("/admin/stats").status_code == 401
+    assert client.get("/weather?city=London&country=gb").status_code == 200
+    assert client.get("/weather?city=London&country=gb").status_code == 200
+
+    response = client.get(
+        "/admin/stats",
+        headers={"Authorization": "Bearer admin-token"},
+    )
+    assert response.status_code == 200
+    stats = response.json()
+    assert stats["cache"]["hits"] == 1
+    assert stats["cache"]["misses"] == 1
+    assert stats["upstream"]["calls"] == 1
+    assert "tokens" not in response.text.lower()
+    assert "dummykey" not in response.text
