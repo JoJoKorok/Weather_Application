@@ -1,0 +1,45 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "weather-application"
+version = "0.3.0.dev0"
+description = "A multilingual weather client with local history and a secure API proxy."
+readme = "README.md"
+requires-python = ">=3.10"
+license = "GPL-3.0-or-later"
+authors = [{ name = "Joseph Bekele" }]
+dependencies = [
+    "pycountry",
+    "requests",
+]
+
+[project.optional-dependencies]
+proxy = [
+    "fastapi",
+    "httpx",
+    "uvicorn",
+]
+dev = [
+    "black",
+    "mypy",
+    "pyinstaller",
+    "pytest",
+    "pytest-asyncio",
+    "pytest-cov",
+    "ruff",
+]
+
+[project.scripts]
+weather-app = "src.main:main"
+
+[tool.setuptools.packages.find]
+include = ["src*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"

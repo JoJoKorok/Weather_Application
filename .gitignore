@@ -14,6 +14,7 @@ venv/
 # Test / build artifacts
 .pytest_cache/
 .coverage
+*.egg-info/
 
 # OS files
 .DS_Store
