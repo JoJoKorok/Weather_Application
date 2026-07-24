@@ -71,6 +71,7 @@ RATE_LIMIT_SALT = os.getenv("RATE_LIMIT_SALT", "weather-application").encode("ut
 HOURLY_LIMIT = int(os.getenv("HOURLY_LIMIT", "250"))
 DAILY_LIMIT = int(os.getenv("DAILY_LIMIT", "1000"))
 RESERVE_PERCENT = max(0, min(int(os.getenv("RESERVE_PERCENT", "20")), 90))
+PERSIST_BUDGETS = _env_bool("PERSIST_BUDGETS", True)
 
 # Cache successful upstream responses for repeated normalized queries.
 default_cache_ttl = "30" if PROXY_MODE == "development" else "600"
@@ -101,6 +102,15 @@ def _enforce_upstream_budget(*, trusted: bool) -> None:
     reserve_multiplier = 1.0 if trusted else (100 - RESERVE_PERCENT) / 100
     allowed_hourly = max(1, int(HOURLY_LIMIT * reserve_multiplier))
     allowed_daily = max(1, int(DAILY_LIMIT * reserve_multiplier))
+
+    if PERSIST_BUDGETS:
+        _usage_hour_count, _usage_count = _consume_persistent_budget(
+            hour_key=current_hour,
+            day_key=today,
+            allowed_hourly=allowed_hourly,
+            allowed_daily=allowed_daily,
+        )
+        return
 
     if _usage_hour_count >= allowed_hourly:
         raise HTTPException(
@@ -242,7 +252,104 @@ def _db_init() -> None:
         conn.execute("CREATE INDEX IF NOT EXISTS idx_weather_history_created ON weather_history(created_utc);")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_weather_history_name ON weather_history(name);")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_weather_history_desc ON weather_history(description);")
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS usage_counters (
+                period_type TEXT NOT NULL,
+                period_key TEXT NOT NULL,
+                request_count INTEGER NOT NULL,
+                PRIMARY KEY (period_type, period_key)
+            );
+            """
+        )
         conn.commit()
+    finally:
+        conn.close()
+
+
+def _consume_persistent_budget(
+    *,
+    hour_key: str,
+    day_key: str,
+    allowed_hourly: int,
+    allowed_daily: int,
+) -> tuple[int, int]:
+    """Atomically reserve one upstream call in SQLite."""
+
+    _db_init()
+    conn = _db_connect()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        hour_row = conn.execute(
+            """
+            SELECT request_count FROM usage_counters
+            WHERE period_type = 'hour' AND period_key = ?;
+            """,
+            (hour_key,),
+        ).fetchone()
+        day_row = conn.execute(
+            """
+            SELECT request_count FROM usage_counters
+            WHERE period_type = 'day' AND period_key = ?;
+            """,
+            (day_key,),
+        ).fetchone()
+
+        hour_count = int(hour_row["request_count"]) if hour_row else 0
+        day_count = int(day_row["request_count"]) if day_row else 0
+        if hour_count >= allowed_hourly:
+            conn.rollback()
+            raise HTTPException(
+                status_code=429,
+                detail="Protective hourly upstream allowance reached.",
+                headers={"Retry-After": "3600"},
+            )
+        if day_count >= allowed_daily:
+            conn.rollback()
+            raise HTTPException(
+                status_code=429,
+                detail="Protective daily upstream allowance reached.",
+                headers={"Retry-After": "3600"},
+            )
+
+        hour_count += 1
+        day_count += 1
+        conn.execute(
+            """
+            INSERT INTO usage_counters (period_type, period_key, request_count)
+            VALUES ('hour', ?, ?)
+            ON CONFLICT(period_type, period_key)
+            DO UPDATE SET request_count = excluded.request_count;
+            """,
+            (hour_key, hour_count),
+        )
+        conn.execute(
+            """
+            INSERT INTO usage_counters (period_type, period_key, request_count)
+            VALUES ('day', ?, ?)
+            ON CONFLICT(period_type, period_key)
+            DO UPDATE SET request_count = excluded.request_count;
+            """,
+            (day_key, day_count),
+        )
+        conn.execute(
+            """
+            DELETE FROM usage_counters
+            WHERE (period_type = 'hour' AND period_key <> ?)
+               OR (period_type = 'day' AND period_key <> ?);
+            """,
+            (hour_key, day_key),
+        )
+        conn.commit()
+        return hour_count, day_count
+    except HTTPException:
+        raise
+    except sqlite3.Error as exc:
+        conn.rollback()
+        raise HTTPException(
+            status_code=503,
+            detail="Protective usage accounting is unavailable.",
+        ) from exc
     finally:
         conn.close()
 

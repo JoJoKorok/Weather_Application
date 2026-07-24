@@ -55,6 +55,7 @@ def reset_proxy_counters(monkeypatch):
     monkeypatch.setattr(server, "DAILY_LIMIT", 1000)
     monkeypatch.setattr(server, "HOURLY_LIMIT", 250)
     monkeypatch.setattr(server, "RESERVE_PERCENT", 20)
+    monkeypatch.setattr(server, "PERSIST_BUDGETS", False)
     monkeypatch.setattr(server, "OPENWEATHER_RATE_LIMIT_PER_MIN", 60)
     monkeypatch.setattr(server, "TRUSTED_RATE_LIMIT_PER_MIN", 120)
     monkeypatch.setattr(server, "QUERY_RATE_LIMIT_PER_10_MIN", 2)
@@ -203,6 +204,24 @@ def test_public_budget_preserves_capacity_for_trusted_token(monkeypatch):
         headers={"Authorization": "Bearer owner-token"},
     )
     assert trusted.status_code == 200
+
+
+def test_persistent_budget_survives_memory_counter_reset(monkeypatch):
+    monkeypatch.setattr(server, "OPENWEATHER_API_KEY", "dummykey")
+    monkeypatch.setattr(server, "PROXY_TOKENS", set())
+    monkeypatch.setattr(server, "DAILY_LIMIT", 1)
+    monkeypatch.setattr(server, "HOURLY_LIMIT", 1)
+    monkeypatch.setattr(server, "RESERVE_PERCENT", 0)
+    monkeypatch.setattr(server, "PERSIST_BUDGETS", True)
+    monkeypatch.setattr(server.httpx, "AsyncClient", DummyAsyncClient)
+    client = TestClient(proxy_app)
+
+    assert client.get("/weather?city=London&country=gb").status_code == 200
+    server._usage_hour = None
+    server._usage_hour_count = 0
+    server._usage_day = None
+    server._usage_count = 0
+    assert client.get("/weather?city=Paris&country=fr").status_code == 429
 
 
 def test_service_and_upstream_emergency_switches(monkeypatch):
