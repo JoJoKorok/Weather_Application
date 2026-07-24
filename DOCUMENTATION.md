@@ -299,47 +299,9 @@ The test runner script is:
 
 The tests expect the proxy to have the committed full proxy behavior, including a root route and a completed `/weather` route. That matters because the current archived working copy of `proxy/server.py` is not the same as the committed version.
 
-## Current Archive State and Important Warning
+## Repository State
 
-There is an important state issue in the archive. The Git history shows that the committed version of `proxy/server.py` had the full proxy implementation. That committed version included:
-
-```text
-root health endpoint
-OpenWeatherMap forwarding
-Bearer-token security
-per-minute rate limiting
-daily global limiting
-proxy-side SQLite history
-history/search endpoints
-```
-
-However, the working copy of `proxy/server.py` saved in the zip is modified and incomplete. It removes the proxy-side database functions, removes the root/history/search endpoints, removes the daily limit, and ends before actually calling OpenWeatherMap or returning data.
-
-There are also two clear bugs in that archived working file:
-
-```python
-auth.lower().startwith("bearer ")
-```
-
-should be:
-
-```python
-auth.lower().startswith("bearer ")
-```
-
-and:
-
-```python
-params["q"] = f"{city.strip(),{country}}"
-```
-
-should be:
-
-```python
-params["q"] = f"{city.strip()},{country}"
-```
-
-Because of this, if the proxy is run from the archived working file as-is, it should not be expected to work correctly. The remembered working version is in Git history at commit `4031eeb`, which is titled `Add proxy logging endpoints and request history`. Since `proxy/server.py` has uncommitted edits, restoring it from `HEAD` would discard those archived working-copy changes, so that should be done intentionally.
+An earlier archive contained an incomplete proxy hidden by Git's `skip-worktree` flag. That copy was preserved under `_trash`, the flag was removed, and the complete tracked implementation was restored. The active proxy now includes health checking, OpenWeatherMap forwarding, optional Bearer-token security, request validation, per-minute and daily limits, upstream error handling, and proxy-side SQLite history.
 
 ## Development Setup
 
