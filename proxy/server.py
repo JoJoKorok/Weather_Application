@@ -1,4 +1,5 @@
 import asyncio
+import hmac
 import json
 import os
 import sqlite3
@@ -18,6 +19,21 @@ Enviroment Pulling Configuration
 # My OpeanWeatherMap API Key variable within Working OS Enviroment
 OPENWEATHER_API_KEY = os.getenv("OPENWEATHER_API_KEY")
 
+
+def _env_bool(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+PROXY_MODE = os.getenv("PROXY_MODE", "production").strip().lower()
+if PROXY_MODE not in {"production", "development", "testing"}:
+    PROXY_MODE = "production"
+
+SERVICE_ENABLED = _env_bool("SERVICE_ENABLED", True)
+UPSTREAM_CALLS_ENABLED = _env_bool("UPSTREAM_CALLS_ENABLED", True)
+
 # Takes env var and turns it into a set of allowed tokens.
 PROXY_TOKENS = set(
     t.strip()
@@ -25,40 +41,68 @@ PROXY_TOKENS = set(
     if t.strip()
 )
 
-# Limits API calls allowed in env var, or defaults to 60 per minute.
-OPENWEATHER_RATE_LIMIT_PER_MIN = int(os.getenv("RATE_LIMIT_PER_MIN", "60"))
+TRUSTED_TOKENS = set(
+    token.strip()
+    for token in os.getenv("TRUSTED_TOKENS", "").split(",")
+    if token.strip()
+)
 
-# Global daily limit for ALL users combined
+# Public clients receive conservative limits. A private trusted token gets a
+# larger interactive allowance and can use the quota reserve.
+default_public_rate = "120" if PROXY_MODE == "development" else "10"
+OPENWEATHER_RATE_LIMIT_PER_MIN = int(os.getenv("RATE_LIMIT_PER_MIN", default_public_rate))
+TRUSTED_RATE_LIMIT_PER_MIN = int(os.getenv("TRUSTED_RATE_LIMIT_PER_MIN", "120"))
+QUERY_RATE_LIMIT_PER_10_MIN = int(os.getenv("QUERY_RATE_LIMIT_PER_10_MIN", "2"))
+
+# Global upstream budgets. The reserve is available only to trusted tokens.
+HOURLY_LIMIT = int(os.getenv("HOURLY_LIMIT", "250"))
 DAILY_LIMIT = int(os.getenv("DAILY_LIMIT", "1000"))
+RESERVE_PERCENT = max(0, min(int(os.getenv("RESERVE_PERCENT", "20")), 90))
 
 # Cache successful upstream responses for repeated normalized queries.
-CACHE_TTL_SECONDS = max(0, int(os.getenv("CACHE_TTL_SECONDS", "600")))
+default_cache_ttl = "30" if PROXY_MODE == "development" else "600"
+CACHE_TTL_SECONDS = max(0, int(os.getenv("CACHE_TTL_SECONDS", default_cache_ttl)))
 CACHE_MAX_ENTRIES = max(1, int(os.getenv("CACHE_MAX_ENTRIES", "500")))
 
-# Tracks usage for the current UTC day
+# Tracks upstream usage for the current UTC hour/day.
+_usage_hour = None
+_usage_hour_count = 0
 _usage_day = None          # e.g. "2025-12-31"
 _usage_count = 0
 
 
-def _enforce_daily_limit() -> None:
-    global _usage_day, _usage_count
+def _enforce_upstream_budget(*, trusted: bool) -> None:
+    global _usage_hour, _usage_hour_count, _usage_day, _usage_count
 
-    # Uses UTC date so it’s consistent regardless of server location
-    today = datetime.now(timezone.utc).date().isoformat()
+    now = datetime.now(timezone.utc)
+    current_hour = now.strftime("%Y-%m-%dT%H")
+    today = now.date().isoformat()
 
-    # Resets counter when the date changes
+    if _usage_hour != current_hour:
+        _usage_hour = current_hour
+        _usage_hour_count = 0
     if _usage_day != today:
         _usage_day = today
         _usage_count = 0
 
-    # Blocks if the global limit is reached
-    if _usage_count >= DAILY_LIMIT:
+    reserve_multiplier = 1.0 if trusted else (100 - RESERVE_PERCENT) / 100
+    allowed_hourly = max(1, int(HOURLY_LIMIT * reserve_multiplier))
+    allowed_daily = max(1, int(DAILY_LIMIT * reserve_multiplier))
+
+    if _usage_hour_count >= allowed_hourly:
         raise HTTPException(
             status_code=429,
-            detail=f"Daily limit reached ({DAILY_LIMIT} requests/day). Try again tomorrow."
+            detail="Protective hourly upstream allowance reached.",
+            headers={"Retry-After": "3600"},
+        )
+    if _usage_count >= allowed_daily:
+        raise HTTPException(
+            status_code=429,
+            detail="Protective daily upstream allowance reached.",
+            headers={"Retry-After": "3600"},
         )
 
-    # Counts this request
+    _usage_hour_count += 1
     _usage_count += 1
 
 
@@ -301,13 +345,13 @@ def _get_bearer_token(request: Request) -> str | None:
 # Function Definition that returns None
 # key = str; idetifier per token or per IP
 # limit = int; max allowed requests per minute
-def _enforce_rate_limit(key: str, limit: int) -> None:
+def _enforce_rate_limit(key: str, limit: int, window_seconds: int = 60) -> None:
 
     # Current UNIX time in seconds as a float
     now = time.time()
 
     # The earliest starting time within the last minute
-    window_start = now - 60
+    window_start = now - window_seconds
 
     # Retrieves the deque for this key
     # If missing, defaultdict(deque) creates an empty deque
@@ -322,9 +366,20 @@ def _enforce_rate_limit(key: str, limit: int) -> None:
     # Checks if the length of q is greater than or equal to the set limit.
     if len(q) >= limit:
         # Raises an exception for the standard "Too Many Requests." code number, 429.
-        raise HTTPException(status_code=429, detail="Rate limit exceeded.")
+        retry_after = max(1, int(q[0] + window_seconds - now))
+        raise HTTPException(
+            status_code=429,
+            detail="Rate limit exceeded.",
+            headers={"Retry-After": str(retry_after)},
+        )
 
     q.append(now)
+
+
+def _token_matches(token: str | None, candidates: set[str]) -> bool:
+    if not token:
+        return False
+    return any(hmac.compare_digest(token, candidate) for candidate in candidates)
 
 
 """
@@ -334,7 +389,11 @@ API Endpoint
 # Basic root endpoint for sanity checks and uptime monitors.
 @app.get("/")
 async def root():
-    return {"status": "ok", "hint": "Use /weather"}
+    return {
+        "status": "ok" if SERVICE_ENABLED else "maintenance",
+        "mode": PROXY_MODE,
+        "hint": "Use /weather",
+    }
 
 
 # Returns recent requests from the proxy DB.
@@ -378,6 +437,9 @@ async def weather(
     units: str = "metric",
     lang: str = "en",
 ):
+    if not SERVICE_ENABLED:
+        raise HTTPException(status_code=503, detail="Weather service is temporarily disabled.")
+
     # Checks if nothing is retrieved for secret key in env vars.
     if not OPENWEATHER_API_KEY:
         raise HTTPException(
@@ -391,8 +453,9 @@ async def weather(
     # Checks if an allowed token(s) has been configured
     # Raises 401 Exception, needing valid credentials.
     if PROXY_TOKENS:
-        if not token or token not in PROXY_TOKENS:
+        if not _token_matches(token, PROXY_TOKENS | TRUSTED_TOKENS):
             raise HTTPException(status_code=401, detail="Unauthorized")
+    trusted = _token_matches(token, TRUSTED_TOKENS)
 
     city = (city or "").strip()
     postal = (postal or "").strip()
@@ -418,7 +481,8 @@ async def weather(
     rate_key = f"tok:{token}" if token else f"ip:{client_ip}"
 
     # Enactment of rate limit on current user, prevents spamming
-    _enforce_rate_limit(rate_key, OPENWEATHER_RATE_LIMIT_PER_MIN)
+    request_limit = TRUSTED_RATE_LIMIT_PER_MIN if trusted else OPENWEATHER_RATE_LIMIT_PER_MIN
+    _enforce_rate_limit(rate_key, request_limit)
 
     key = _cache_key(city=city, postal=postal, country=country, units=units, lang=lang)
     cached = _cache_get(key)
@@ -438,8 +502,20 @@ async def weather(
             response.headers["X-Weather-Cache-Age"] = str(age)
             return _weather_payload(data)
 
-        # Only real upstream calls consume the protective daily allowance.
-        _enforce_daily_limit()
+        if not UPSTREAM_CALLS_ENABLED:
+            raise HTTPException(
+                status_code=503,
+                detail="Live weather refreshes are temporarily disabled.",
+            )
+
+        # Limit cache-miss traffic for one normalized location, then consume
+        # the appropriate public or trusted portion of the global budgets.
+        _enforce_rate_limit(
+            f"query:{key}",
+            QUERY_RATE_LIMIT_PER_10_MIN,
+            window_seconds=600,
+        )
+        _enforce_upstream_budget(trusted=trusted)
 
         params = {
             "appid": OPENWEATHER_API_KEY,
