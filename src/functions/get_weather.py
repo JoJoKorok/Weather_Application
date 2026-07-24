@@ -1,4 +1,6 @@
-import os, requests
+import os
+
+import requests
 from src.data.i18n import TEXT, jp_description_from_weather
 from src.data.local_history import init_db, log_weather, fetch_history, search_history
 

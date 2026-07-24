@@ -23,9 +23,6 @@ def _t(lang: str, key: str, default: str) -> str:
     return default
 
 
-lang = "en"  # Default; we ask inside __main__ so tests can import this file safely.
-
-
 def _print_history(items: list[dict], lang: str) -> None:
     # Prints history in a readable format (not raw JSON).
 
@@ -53,7 +50,19 @@ def _print_history(items: list[dict], lang: str) -> None:
     print(_t(lang, "history_footer", "---------------------\n"))
 
 
-if __name__ == "__main__":
+def _parse_history_limit(raw: str, default: int = 10) -> int:
+    value = (raw or "").strip()
+    if not value:
+        return default
+
+    try:
+        return max(1, min(int(value), 200))
+    except ValueError:
+        return default
+
+
+def main() -> int:
+    """Run the interactive weather client."""
 
     # Pick a language for prompts/output.
     # Default is English if the user types something unexpected.
@@ -83,7 +92,7 @@ if __name__ == "__main__":
 
         if choice in ("h", "history"):
             limit_raw = input(_t(lang, "history_count", "How many entries? (default 10): ")).strip()
-            limit = int(limit_raw) if limit_raw else 10
+            limit = _parse_history_limit(limit_raw)
 
             result = get_local_history(limit=limit)
             _print_history(result.get("items", []), lang=lang)
@@ -99,3 +108,9 @@ if __name__ == "__main__":
 
         else:
             print(_t(lang, "unknown_option", "Unknown option. Use 'h', 's', or Enter."))
+
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

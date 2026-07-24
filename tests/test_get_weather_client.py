@@ -1,4 +1,4 @@
-import requests, pytest
+import requests
 from src.functions.get_weather import get_weather_by_city_name, get_weather_by_postal_code
 
 

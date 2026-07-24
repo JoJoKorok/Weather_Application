@@ -1,5 +1,6 @@
-import builtins, pytest
-from src.data.country_codes import resolve_country, prompt_country_code
+import builtins
+
+from src.data.country_codes import prompt_country_code, resolve_country
 
 
 

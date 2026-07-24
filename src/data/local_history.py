@@ -1,4 +1,6 @@
-import os, json, sqlite3
+import json
+import os
+import sqlite3
 from pathlib import Path
 from datetime import datetime, timezone
 
@@ -151,7 +153,11 @@ def search_history(q: str, limit: int = 25) -> list[dict]:
     # Simple LIKE search on city/name/description.
 
     limit = max(1, min(int(limit), 200))
-    needle = f"%{(q or '').strip().lower()}%"
+    query = (q or "").strip().lower()
+    if not query:
+        return []
+
+    needle = f"%{query}%"
 
     conn = _connect()
     try:

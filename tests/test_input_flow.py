@@ -1,9 +1,5 @@
-import builtins, pytest
+import builtins
 
-'''from ..src.data.country_codes import prompt_country_code, resolve_country
-from ..src.functions.det_questions import location_data'''
-
-from src.data.country_codes import prompt_country_code, resolve_country
 from src.functions.det_questions import location_data
 
 
