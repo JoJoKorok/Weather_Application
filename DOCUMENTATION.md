@@ -183,7 +183,20 @@ WEATHER_DB_PATH
 
 `RATE_LIMIT_PER_MIN` controls how many requests are allowed per minute. The proxy uses an in-memory dictionary of timestamp queues, so each token or IP address gets its own recent-request list. When the list becomes too long inside the 60-second window, the proxy returns HTTP 429.
 
-`DAILY_LIMIT` was added to control the total number of requests for all users combined in a UTC day. This is also tracked in memory, which means it can reset if the Render service restarts. It is still useful as a simple protection layer, but it is not the same as a permanent billing-safe counter in a database.
+`DAILY_LIMIT` controls the total upstream requests for all users combined in a
+UTC day, and `HOURLY_LIMIT` provides a shorter protective window.
+
+The current proxy persists hourly and daily upstream budgets atomically in its
+SQLite database when `PERSIST_BUDGETS=true`. On Render, these counters survive
+restarts only when `WEATHER_DB_PATH` points to a mounted persistent disk. Public
+traffic is prevented from consuming the percentage configured by
+`RESERVE_PERCENT`; trusted owner tokens can use that reserve.
+
+Successful normalized queries are cached for `CACHE_TTL_SECONDS`, and concurrent
+requests for the same uncached location are coalesced into one OpenWeatherMap
+request. Public clients are limited by IP, anonymous installation ID, normalized
+query, and global budgets. The in-memory registries also have hard capacity bounds
+to prevent unbounded growth under hostile traffic.
 
 `WEATHER_DB_PATH` was used by the committed proxy version to control where proxy-side SQLite request history is saved. If not set, it defaults to `proxy/weather_history.sqlite`.
 

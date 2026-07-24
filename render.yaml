@@ -1,0 +1,50 @@
+services:
+  - type: web
+    name: weather-application
+    runtime: python
+    buildCommand: pip install -r proxy/requirements.txt
+    startCommand: uvicorn proxy.server:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /
+    envVars:
+      - key: OPENWEATHER_API_KEY
+        sync: false
+      - key: PROXY_MODE
+        value: production
+      - key: SERVICE_ENABLED
+        value: "true"
+      - key: UPSTREAM_CALLS_ENABLED
+        value: "true"
+      - key: RATE_LIMIT_PER_MIN
+        value: "10"
+      - key: TRUSTED_RATE_LIMIT_PER_MIN
+        value: "120"
+      - key: QUERY_RATE_LIMIT_PER_10_MIN
+        value: "2"
+      - key: TRUSTED_QUERY_RATE_LIMIT_PER_10_MIN
+        value: "30"
+      - key: HOURLY_LIMIT
+        value: "250"
+      - key: DAILY_LIMIT
+        value: "1000"
+      - key: RESERVE_PERCENT
+        value: "20"
+      - key: CACHE_TTL_SECONDS
+        value: "600"
+      - key: CACHE_MAX_ENTRIES
+        value: "500"
+      - key: MAX_RATE_LIMIT_KEYS
+        value: "10000"
+      - key: MAX_QUERY_LOCKS
+        value: "1000"
+      - key: PERSIST_BUDGETS
+        value: "true"
+      - key: WEATHER_DB_PATH
+        value: /opt/render/project/src/storage/weather_history.sqlite
+      - key: HISTORY_ENDPOINTS_ENABLED
+        value: "false"
+      - key: TRUSTED_TOKENS
+        sync: false
+      - key: ADMIN_TOKENS
+        sync: false
+      - key: RATE_LIMIT_SALT
+        sync: false
