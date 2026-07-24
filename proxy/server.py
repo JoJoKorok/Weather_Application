@@ -77,6 +77,8 @@ PERSIST_BUDGETS = _env_bool("PERSIST_BUDGETS", True)
 default_cache_ttl = "30" if PROXY_MODE == "development" else "600"
 CACHE_TTL_SECONDS = max(0, int(os.getenv("CACHE_TTL_SECONDS", default_cache_ttl)))
 CACHE_MAX_ENTRIES = max(1, int(os.getenv("CACHE_MAX_ENTRIES", "500")))
+MAX_RATE_LIMIT_KEYS = max(100, int(os.getenv("MAX_RATE_LIMIT_KEYS", "10000")))
+MAX_QUERY_LOCKS = max(CACHE_MAX_ENTRIES, int(os.getenv("MAX_QUERY_LOCKS", "1000")))
 
 # Tracks upstream usage for the current UTC hour/day.
 _usage_hour = None
@@ -186,6 +188,31 @@ def _cache_put(key: str, data: dict) -> None:
         lock = _query_locks.get(evicted_key)
         if lock is not None and not lock.locked():
             _query_locks.pop(evicted_key, None)
+
+
+def _query_lock(key: str) -> asyncio.Lock:
+    existing = _query_locks.get(key)
+    if existing is not None:
+        return existing
+
+    if len(_query_locks) >= MAX_QUERY_LOCKS:
+        for candidate, lock in list(_query_locks.items()):
+            if not lock.locked() and candidate not in _weather_cache:
+                _query_locks.pop(candidate, None)
+                if len(_query_locks) < MAX_QUERY_LOCKS:
+                    break
+
+    if len(_query_locks) >= MAX_QUERY_LOCKS:
+        _metrics["state_capacity_rejections"] += 1
+        raise HTTPException(
+            status_code=503,
+            detail="Weather request capacity is temporarily full.",
+            headers={"Retry-After": "30"},
+        )
+
+    lock = asyncio.Lock()
+    _query_locks[key] = lock
+    return lock
 
 
 def _weather_payload(data: dict) -> dict:
@@ -474,8 +501,25 @@ def _enforce_rate_limit(key: str, limit: int, window_seconds: int = 60) -> None:
     # The earliest starting time within the last minute
     window_start = now - window_seconds
 
-    # Retrieves the deque for this key
-    # If missing, defaultdict(deque) creates an empty deque
+    if key not in _hits and len(_hits) >= MAX_RATE_LIMIT_KEYS:
+        oldest_relevant_time = now - 600
+        for candidate, timestamps in list(_hits.items()):
+            while timestamps and timestamps[0] < oldest_relevant_time:
+                timestamps.popleft()
+            if not timestamps:
+                _hits.pop(candidate, None)
+            if len(_hits) < MAX_RATE_LIMIT_KEYS:
+                break
+
+    if key not in _hits and len(_hits) >= MAX_RATE_LIMIT_KEYS:
+        _metrics["state_capacity_rejections"] += 1
+        raise HTTPException(
+            status_code=503,
+            detail="Rate-limit capacity is temporarily full.",
+            headers={"Retry-After": "30"},
+        )
+
+    # Retrieves the deque for this key.
     q = _hits[key]
 
     # While loop removing timestamps older than 60 from q
@@ -591,6 +635,7 @@ async def admin_stats(request: Request):
             "trusted_day_limit": DAILY_LIMIT,
         },
         "rate_limit_rejections": _metrics["rate_limit_rejections"],
+        "state_capacity_rejections": _metrics["state_capacity_rejections"],
     }
 
 
@@ -668,7 +713,7 @@ async def weather(
         response.headers["X-Weather-Cache-Age"] = str(age)
         return _weather_payload(data)
 
-    lock = _query_locks.setdefault(key, asyncio.Lock())
+    lock = _query_lock(key)
     async with lock:
         # Another request might have filled the cache while this one waited.
         cached = None if force_refresh else _cache_get(key)

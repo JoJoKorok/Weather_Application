@@ -67,6 +67,8 @@ def reset_proxy_counters(monkeypatch):
     monkeypatch.setattr(server, "UPSTREAM_CALLS_ENABLED", True)
     monkeypatch.setattr(server, "CACHE_TTL_SECONDS", 600)
     monkeypatch.setattr(server, "CACHE_MAX_ENTRIES", 500)
+    monkeypatch.setattr(server, "MAX_RATE_LIMIT_KEYS", 10000)
+    monkeypatch.setattr(server, "MAX_QUERY_LOCKS", 1000)
 
 
 def test_proxy_root_ok():
@@ -275,6 +277,36 @@ def test_only_trusted_token_can_force_refresh(monkeypatch):
     )
     assert trusted.headers["X-Weather-Cache"] == "MISS"
     assert DummyAsyncClient.calls == 2
+
+
+def test_rate_limit_state_has_a_hard_capacity(monkeypatch):
+    monkeypatch.setattr(server, "MAX_RATE_LIMIT_KEYS", 100)
+    now = server.time.time()
+    for index in range(100):
+        server._hits[f"occupied:{index}"].append(now)
+
+    with pytest.raises(server.HTTPException) as exc_info:
+        server._enforce_rate_limit("new-key", 10)
+
+    assert exc_info.value.status_code == 503
+    assert server._metrics["state_capacity_rejections"] == 1
+
+
+def test_query_lock_state_has_a_hard_capacity(monkeypatch):
+    monkeypatch.setattr(server, "MAX_QUERY_LOCKS", 1)
+    existing = server.asyncio.Lock()
+    server._query_locks["occupied"] = existing
+
+    async def exercise_capacity():
+        await existing.acquire()
+        try:
+            with pytest.raises(server.HTTPException) as exc_info:
+                server._query_lock("new-key")
+            assert exc_info.value.status_code == 503
+        finally:
+            existing.release()
+
+    server.asyncio.run(exercise_capacity())
 
 
 def test_proxy_maps_upstream_timeout_to_gateway_timeout(monkeypatch):
