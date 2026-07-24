@@ -39,6 +39,9 @@ TEXT = {
         "postal_not_found": "Error: Postal code not found",
         "unauthorized_proxy": "Error: Unauthorized proxy request. Check proxy token.",
         "rate_limited": "Error: Proxy rate limit exceeded. Please try again later.",
+        "rate_limited_retry": "Request limit reached. Try again in about {seconds} seconds.",
+        "service_paused": "Live weather is temporarily unavailable.",
+        "cached_result": "Cached result ({seconds} seconds old).",
         "http_error": "HTTP error occurred",
         "request_error": "An error occurred during the API request",
 
@@ -84,6 +87,9 @@ TEXT = {
         "postal_not_found": "エラー: 郵便番号が見つかりません",
         "unauthorized_proxy": "エラー: 認証に失敗しました（トークン確認）",
         "rate_limited": "エラー: レート制限です。少し待ってから再試行してください。",
+        "rate_limited_retry": "リクエスト制限です。約{seconds}秒後に再試行してください。",
+        "service_paused": "現在、ライブ天気情報を一時停止しています。",
+        "cached_result": "キャッシュ結果（{seconds}秒前）。",
         "http_error": "HTTPエラー",
         "request_error": "APIリクエスト中にエラーが発生しました",
 

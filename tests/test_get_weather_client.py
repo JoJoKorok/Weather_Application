@@ -8,6 +8,7 @@ class DummyResponse:
     def __init__(self, status_code=200, json_data=None):
         self.status_code = status_code
         self._json_data = json_data or {}
+        self.headers = {}
 
     def raise_for_status(self):
         if self.status_code >= 400:
@@ -96,3 +97,42 @@ def test_timeout_prints_request_error(monkeypatch, capsys, set_proxy_env):
     out = capsys.readouterr().out.lower()
 
     assert "timed out" in out or "error" in out
+
+
+def test_client_sends_anonymous_id_and_force_refresh(monkeypatch, set_proxy_env):
+    payload = {
+        "name": "London",
+        "main": {"temp": 10.0, "humidity": 50},
+        "wind": {"speed": 2.5},
+        "weather": [{"description": "clear sky"}],
+    }
+    monkeypatch.setenv("WEATHER_FORCE_REFRESH", "true")
+
+    def fake_get(url, params=None, headers=None, timeout=None):
+        assert headers["X-Weather-Client"]
+        assert headers["Cache-Control"] == "no-cache"
+        return DummyResponse(200, payload)
+
+    monkeypatch.setattr("src.functions.get_weather.requests.get", fake_get)
+    get_weather_by_city_name("London", "GB")
+
+
+def test_client_prints_cache_age(monkeypatch, capsys, set_proxy_env):
+    payload = {
+        "name": "London",
+        "main": {"temp": 10.0, "humidity": 50},
+        "wind": {"speed": 2.5},
+        "weather": [{"description": "clear sky"}],
+    }
+    response = DummyResponse(200, payload)
+    response.headers = {
+        "X-Weather-Cache": "HIT",
+        "X-Weather-Cache-Age": "42",
+    }
+    monkeypatch.setattr(
+        "src.functions.get_weather.requests.get",
+        lambda *args, **kwargs: response,
+    )
+
+    get_weather_by_city_name("London", "GB")
+    assert "42 seconds old" in capsys.readouterr().out

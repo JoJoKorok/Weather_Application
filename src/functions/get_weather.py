@@ -1,6 +1,7 @@
 import os
 
 import requests
+from src.data.client_identity import get_or_create_client_id
 from src.data.i18n import TEXT, jp_description_from_weather
 from src.data.local_history import init_db, log_weather, fetch_history, search_history
 
@@ -33,8 +34,44 @@ def _get_proxy_url() -> str:
 def _get_proxy_headers() -> dict:
     # Optional Bearer token for proxy auth.
 
+    headers = {"X-Weather-Client": get_or_create_client_id()}
     token = os.getenv("WEATHER_PROXY_TOKEN", "").strip()
-    return {"Authorization": f"Bearer {token}"} if token else {}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    if os.getenv("WEATHER_FORCE_REFRESH", "").strip().lower() in {"1", "true", "yes", "on"}:
+        headers["Cache-Control"] = "no-cache"
+    return headers
+
+
+def _print_response_source(response, lang: str) -> None:
+    if response.headers.get("X-Weather-Cache") != "HIT":
+        return
+
+    age = response.headers.get("X-Weather-Cache-Age", "0")
+    print(_t(lang, "cached_result", "Cached result ({seconds} seconds old).").format(seconds=age))
+
+
+def _print_http_error(response, http_err, lang: str, not_found_message: str) -> None:
+    if response.status_code == 404:
+        print(not_found_message)
+    elif response.status_code == 401:
+        print(_t(lang, "unauthorized_proxy", "Error: Unauthorized proxy request. Check proxy token."))
+    elif response.status_code == 429:
+        retry_after = response.headers.get("Retry-After")
+        if retry_after:
+            print(
+                _t(
+                    lang,
+                    "rate_limited_retry",
+                    "Request limit reached. Try again in about {seconds} seconds.",
+                ).format(seconds=retry_after)
+            )
+        else:
+            print(_t(lang, "rate_limited", "Error: Proxy rate limit exceeded. Please try again later."))
+    elif response.status_code == 503:
+        print(_t(lang, "service_paused", "Live weather is temporarily unavailable."))
+    else:
+        print(f"{_t(lang, 'http_error', 'HTTP error occurred')}: {http_err}")
 
 
 def _normalize_lang(lang: str) -> str:
@@ -82,6 +119,7 @@ def get_weather_by_city_name(city_name, country_code, lang: str = "en"):
         response.raise_for_status()
 
         weather_data = response.json()
+        _print_response_source(response, lang)
 
         main_data = weather_data.get("main", {}) or {}
         area_name = weather_data.get("name")
@@ -112,14 +150,12 @@ def get_weather_by_city_name(city_name, country_code, lang: str = "en"):
             print(f"{_t(lang, 'incomplete_city', 'Could not retrieve complete weather data for')} {city_name}")
 
     except requests.exceptions.HTTPError as http_err:
-        if response.status_code == 404:
-            print(f"{_t(lang, 'city_not_found', 'Error: City not found')}: '{city_name}'.")
-        elif response.status_code == 401:
-            print(_t(lang, "unauthorized_proxy", "Error: Unauthorized proxy request. Check proxy token."))
-        elif response.status_code == 429:
-            print(_t(lang, "rate_limited", "Error: Proxy rate limit exceeded. Please try again later."))
-        else:
-            print(f"{_t(lang, 'http_error', 'HTTP error occurred')}: {http_err}")
+        _print_http_error(
+            response,
+            http_err,
+            lang,
+            f"{_t(lang, 'city_not_found', 'Error: City not found')}: '{city_name}'.",
+        )
     except requests.exceptions.RequestException as req_err:
         print(f"{_t(lang, 'request_error', 'An error occurred during the API request')}: {req_err}")
 
@@ -147,6 +183,7 @@ def get_weather_by_postal_code(postal_code, country_code="us", lang: str = "en")
         response.raise_for_status()
 
         weather_data = response.json()
+        _print_response_source(response, lang)
 
         main_data = weather_data.get("main", {}) or {}
         area_name = weather_data.get("name")
@@ -177,14 +214,15 @@ def get_weather_by_postal_code(postal_code, country_code="us", lang: str = "en")
             print(f"{_t(lang, 'incomplete_postal', 'Incomplete weather data retrieved for')}: {postal_code}, {country_code.upper()}")
 
     except requests.exceptions.HTTPError as http_err:
-        if response.status_code == 404:
-            print(f"{_t(lang, 'postal_not_found', 'Error: Postal code not found')}: '{postal_code}, {country_code.upper()}'.")
-        elif response.status_code == 401:
-            print(_t(lang, "unauthorized_proxy", "Error: Unauthorized proxy request. Check proxy token."))
-        elif response.status_code == 429:
-            print(_t(lang, "rate_limited", "Error: Proxy rate limit exceeded. Please try again later."))
-        else:
-            print(f"{_t(lang, 'http_error', 'HTTP error occurred')}: {http_err}")
+        _print_http_error(
+            response,
+            http_err,
+            lang,
+            (
+                f"{_t(lang, 'postal_not_found', 'Error: Postal code not found')}: "
+                f"'{postal_code}, {country_code.upper()}'."
+            ),
+        )
     except requests.exceptions.RequestException as req_err:
         print(f"{_t(lang, 'request_error', 'An error occurred during the API request')}: {req_err}")
 

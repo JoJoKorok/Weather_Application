@@ -58,6 +58,7 @@ def reset_proxy_counters(monkeypatch):
     monkeypatch.setattr(server, "OPENWEATHER_RATE_LIMIT_PER_MIN", 60)
     monkeypatch.setattr(server, "TRUSTED_RATE_LIMIT_PER_MIN", 120)
     monkeypatch.setattr(server, "QUERY_RATE_LIMIT_PER_10_MIN", 2)
+    monkeypatch.setattr(server, "TRUSTED_QUERY_RATE_LIMIT_PER_10_MIN", 30)
     monkeypatch.setattr(server, "TRUSTED_TOKENS", set())
     monkeypatch.setattr(server, "ADMIN_TOKENS", set())
     monkeypatch.setattr(server, "HISTORY_ENDPOINTS_ENABLED", False)
@@ -230,6 +231,31 @@ def test_cached_results_remain_available_when_upstream_disabled(monkeypatch):
     cached = client.get("/weather?city=London&country=gb")
     assert cached.status_code == 200
     assert cached.headers["X-Weather-Cache"] == "HIT"
+
+
+def test_only_trusted_token_can_force_refresh(monkeypatch):
+    monkeypatch.setattr(server, "OPENWEATHER_API_KEY", "dummykey")
+    monkeypatch.setattr(server, "PROXY_TOKENS", set())
+    monkeypatch.setattr(server, "TRUSTED_TOKENS", {"owner-token"})
+    monkeypatch.setattr(server.httpx, "AsyncClient", DummyAsyncClient)
+    client = TestClient(proxy_app)
+
+    assert client.get("/weather?city=London&country=gb").status_code == 200
+    public = client.get(
+        "/weather?city=London&country=gb",
+        headers={"Cache-Control": "no-cache"},
+    )
+    assert public.headers["X-Weather-Cache"] == "HIT"
+
+    trusted = client.get(
+        "/weather?city=London&country=gb",
+        headers={
+            "Authorization": "Bearer owner-token",
+            "Cache-Control": "no-cache",
+        },
+    )
+    assert trusted.headers["X-Weather-Cache"] == "MISS"
+    assert DummyAsyncClient.calls == 2
 
 
 def test_proxy_maps_upstream_timeout_to_gateway_timeout(monkeypatch):

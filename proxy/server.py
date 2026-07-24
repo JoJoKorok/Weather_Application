@@ -1,9 +1,11 @@
 import asyncio
+import hashlib
 import hmac
 import json
 import os
 import sqlite3
 import time
+import uuid
 from collections import OrderedDict, defaultdict, deque
 from pathlib import Path
 from datetime import datetime, timezone
@@ -60,6 +62,10 @@ default_public_rate = "120" if PROXY_MODE == "development" else "10"
 OPENWEATHER_RATE_LIMIT_PER_MIN = int(os.getenv("RATE_LIMIT_PER_MIN", default_public_rate))
 TRUSTED_RATE_LIMIT_PER_MIN = int(os.getenv("TRUSTED_RATE_LIMIT_PER_MIN", "120"))
 QUERY_RATE_LIMIT_PER_10_MIN = int(os.getenv("QUERY_RATE_LIMIT_PER_10_MIN", "2"))
+TRUSTED_QUERY_RATE_LIMIT_PER_10_MIN = int(
+    os.getenv("TRUSTED_QUERY_RATE_LIMIT_PER_10_MIN", "30")
+)
+RATE_LIMIT_SALT = os.getenv("RATE_LIMIT_SALT", "weather-application").encode("utf-8")
 
 # Global upstream budgets. The reserve is available only to trusted tokens.
 HOURLY_LIMIT = int(os.getenv("HOURLY_LIMIT", "250"))
@@ -391,6 +397,17 @@ def _token_matches(token: str | None, candidates: set[str]) -> bool:
     return any(hmac.compare_digest(token, candidate) for candidate in candidates)
 
 
+def _anonymous_client_key(request: Request) -> str | None:
+    raw = request.headers.get("x-weather-client", "").strip()
+    try:
+        normalized = str(uuid.UUID(raw))
+    except (ValueError, AttributeError):
+        return None
+
+    digest = hashlib.sha256(RATE_LIMIT_SALT + normalized.encode("utf-8")).hexdigest()
+    return digest[:24]
+
+
 def _require_admin(request: Request) -> str:
     if not ADMIN_TOKENS:
         raise HTTPException(status_code=404, detail="Not found")
@@ -502,6 +519,7 @@ async def weather(
         if not _token_matches(token, PROXY_TOKENS | TRUSTED_TOKENS):
             raise HTTPException(status_code=401, detail="Unauthorized")
     trusted = _token_matches(token, TRUSTED_TOKENS)
+    force_refresh = trusted and "no-cache" in request.headers.get("cache-control", "").lower()
 
     city = (city or "").strip()
     postal = (postal or "").strip()
@@ -524,14 +542,18 @@ async def weather(
     # Assigns key for rate limiting
     # If a token exists, it assigns it as rate limit/token
     # Otherwise, it assigns it as rate limit/IP
-    rate_key = f"tok:{token}" if token else f"ip:{client_ip}"
-
-    # Enactment of rate limit on current user, prevents spamming
+    # Apply the allowance independently to the source IP and anonymous
+    # installation ID. A trusted token gets the larger development allowance.
     request_limit = TRUSTED_RATE_LIMIT_PER_MIN if trusted else OPENWEATHER_RATE_LIMIT_PER_MIN
-    _enforce_rate_limit(rate_key, request_limit)
+    _enforce_rate_limit(f"ip:{client_ip}", request_limit)
+    client_key = _anonymous_client_key(request)
+    if client_key:
+        _enforce_rate_limit(f"client:{client_key}", request_limit)
+    if trusted:
+        _enforce_rate_limit(f"trusted:{token}", request_limit)
 
     key = _cache_key(city=city, postal=postal, country=country, units=units, lang=lang)
-    cached = _cache_get(key)
+    cached = None if force_refresh else _cache_get(key)
     if cached:
         _metrics["cache_hits"] += 1
         data, age = cached
@@ -542,7 +564,7 @@ async def weather(
     lock = _query_locks.setdefault(key, asyncio.Lock())
     async with lock:
         # Another request might have filled the cache while this one waited.
-        cached = _cache_get(key)
+        cached = None if force_refresh else _cache_get(key)
         if cached:
             _metrics["cache_hits"] += 1
             data, age = cached
@@ -562,7 +584,11 @@ async def weather(
         # the appropriate public or trusted portion of the global budgets.
         _enforce_rate_limit(
             f"query:{key}",
-            QUERY_RATE_LIMIT_PER_10_MIN,
+            (
+                TRUSTED_QUERY_RATE_LIMIT_PER_10_MIN
+                if trusted
+                else QUERY_RATE_LIMIT_PER_10_MIN
+            ),
             window_seconds=600,
         )
         _enforce_upstream_budget(trusted=trusted)
