@@ -1,7 +1,15 @@
 $ErrorActionPreference = "Stop"
+$Root = $PSScriptRoot
+$Python = Join-Path $Root ".venv\Scripts\python.exe"
 
-if (!(Test-Path ".venv")) {
-  .\setup.ps1
+if (!(Test-Path -LiteralPath $Python)) {
+  & (Join-Path $Root "setup.ps1")
 }
 
-.\.venv\Scripts\python src\main.py
+Push-Location $Root
+try {
+  & $Python -m src.main
+}
+finally {
+  Pop-Location
+}
