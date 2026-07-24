@@ -1,5 +1,7 @@
-import sys, pytest
+import sys
 from pathlib import Path
+
+import pytest
 
 
 
@@ -7,6 +9,15 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
+
+
+@pytest.fixture(autouse=True)
+def isolate_runtime_data(monkeypatch, tmp_path):
+    """Keep tests from reading or writing a user's real weather history."""
+
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path / "local"))
+    monkeypatch.setenv("WEATHER_DB_PATH", str(tmp_path / "proxy" / "history.sqlite"))
+
 
 @pytest.fixture
 def set_proxy_env(monkeypatch):

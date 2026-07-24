@@ -1,7 +1,12 @@
-import os, time, httpx, sqlite3, json
+import json
+import os
+import sqlite3
+import time
 from pathlib import Path
 from collections import defaultdict, deque
 from datetime import datetime, timezone
+
+import httpx
 from fastapi import FastAPI, HTTPException, Request
 
 
@@ -125,6 +130,7 @@ def _db_init() -> None:
 def _db_log(*, query_type: str, city: str | None, postal: str | None, country: str, units: str, data: dict) -> None:
     # Inserts one successful weather call into the DB.
 
+    _db_init()
     created_utc = datetime.now(timezone.utc).isoformat()
 
     main = data.get("main", {}) or {}
@@ -159,6 +165,7 @@ def _db_log(*, query_type: str, city: str | None, postal: str | None, country: s
 def _db_fetch_history(limit: int = 25) -> list[dict]:
     # Pulls the most recent N requests.
 
+    _db_init()
     limit = max(1, min(int(limit), 200))
 
     conn = _db_connect()
@@ -183,6 +190,7 @@ def _db_search(q: str, limit: int = 25) -> list[dict]:
     # Searches by city/name/description.
     # Uses LIKE so it's simple and doesn't need full-text extensions.
 
+    _db_init()
     limit = max(1, min(int(limit), 200))
     needle = f"%{(q or '').strip().lower()}%"
 
@@ -206,13 +214,6 @@ def _db_search(q: str, limit: int = 25) -> list[dict]:
         return [dict(r) for r in rows]
     finally:
         conn.close()
-
-
-# Runs once when the proxy starts.
-# Sets up the SQLite file/table if missing.
-@app.on_event("startup")
-def _startup() -> None:
-    _db_init()
 
 
 """
@@ -314,10 +315,6 @@ async def weather(
     units: str = "metric",
     lang: str = "en",
 ):
-
-    # Enforce daily limit at start of request
-    _enforce_daily_limit()
-
     # Checks if nothing is retrieved for secret key in env vars.
     if not OPENWEATHER_API_KEY:
         raise HTTPException(
@@ -334,6 +331,21 @@ async def weather(
         if not token or token not in PROXY_TOKENS:
             raise HTTPException(status_code=401, detail="Unauthorized")
 
+    city = (city or "").strip()
+    postal = (postal or "").strip()
+    country = (country or "").strip().upper()
+    units = (units or "").strip().lower()
+    lang = (lang or "").strip().lower()
+
+    if bool(city) == bool(postal):
+        raise HTTPException(status_code=400, detail="Provide exactly one of city or postal")
+    if len(country) != 2 or not country.isalpha():
+        raise HTTPException(status_code=400, detail="country must be an ISO alpha-2 code")
+    if units not in {"standard", "metric", "imperial"}:
+        raise HTTPException(status_code=400, detail="units must be standard, metric, or imperial")
+    if lang not in {"en", "ja"}:
+        raise HTTPException(status_code=400, detail="lang must be en or ja")
+
     # Assigns current client IP to 'client_ip'
     client_ip = request.client.host if request.client else "unknown"
 
@@ -345,35 +357,33 @@ async def weather(
     # Enactment of rate limit on current user, prevents spamming
     _enforce_rate_limit(rate_key, OPENWEATHER_RATE_LIMIT_PER_MIN)
 
-    # Normalizes country code for OpenWeather
-    country = country.strip().upper()
+    # Count only authenticated, valid requests against the global allowance.
+    _enforce_daily_limit()
 
     # Parameters for OpenWeather API request
     params = {
         "appid": OPENWEATHER_API_KEY,
         "units": units,
-        "lang": (lang or "en").strip().lower()
+        "lang": lang,
     }
 
     # Uses city search if provided
     if city:
-        params["q"] = f"{city.strip()},{country}"
+        params["q"] = f"{city},{country}"
 
     # Uses postal search if provided
     elif postal:
-        params["zip"] = f"{postal.strip()},{country}"
-
-    # Otherwise request is invalid
-    else:
-        raise HTTPException(
-            status_code=400,
-            detail="Provide either city or postal"
-        )
+        params["zip"] = f"{postal},{country}"
     
     
     # Calls OpenWeatherMap with an async HTTP client with an 8-second timeout.
-    async with httpx.AsyncClient(timeout=8) as client_http:
-        response = await client_http.get(OPENWEATHER_URL, params=params)
+    try:
+        async with httpx.AsyncClient(timeout=8) as client_http:
+            response = await client_http.get(OPENWEATHER_URL, params=params)
+    except httpx.TimeoutException as exc:
+        raise HTTPException(status_code=504, detail="Weather provider timed out") from exc
+    except httpx.HTTPError as exc:
+        raise HTTPException(status_code=502, detail="Weather provider unavailable") from exc
 
     # Checks OpenWeatherMap Call response code for failure codes.
     if response.status_code != 200:
@@ -393,8 +403,8 @@ async def weather(
     # Logs the successful call into SQLite history.
     _db_log(
         query_type="city" if city else "postal",
-        city=city.strip() if city else None,
-        postal=postal.strip() if postal else None,
+        city=city or None,
+        postal=postal or None,
         country=country,
         units=units,
         data=data,
