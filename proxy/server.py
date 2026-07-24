@@ -1,13 +1,14 @@
+import asyncio
 import json
 import os
 import sqlite3
 import time
+from collections import OrderedDict, defaultdict, deque
 from pathlib import Path
-from collections import defaultdict, deque
 from datetime import datetime, timezone
 
 import httpx
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Request, Response
 
 
 """
@@ -29,6 +30,10 @@ OPENWEATHER_RATE_LIMIT_PER_MIN = int(os.getenv("RATE_LIMIT_PER_MIN", "60"))
 
 # Global daily limit for ALL users combined
 DAILY_LIMIT = int(os.getenv("DAILY_LIMIT", "1000"))
+
+# Cache successful upstream responses for repeated normalized queries.
+CACHE_TTL_SECONDS = max(0, int(os.getenv("CACHE_TTL_SECONDS", "600")))
+CACHE_MAX_ENTRIES = max(1, int(os.getenv("CACHE_MAX_ENTRIES", "500")))
 
 # Tracks usage for the current UTC day
 _usage_day = None          # e.g. "2025-12-31"
@@ -66,6 +71,63 @@ app = FastAPI()
 
 # Maps a key to a deque of timestamps if the key doesn't exist.
 _hits = defaultdict(deque)
+
+# LRU-style response cache and per-query locks. Locks collapse simultaneous
+# cache misses so only one request reaches OpenWeatherMap for a location.
+_weather_cache: OrderedDict[str, tuple[float, dict]] = OrderedDict()
+_query_locks: dict[str, asyncio.Lock] = {}
+
+
+def _cache_key(
+    *,
+    city: str,
+    postal: str,
+    country: str,
+    units: str,
+    lang: str,
+) -> str:
+    query_type = "city" if city else "postal"
+    query = city.casefold() if city else postal.casefold()
+    return "|".join((query_type, query, country.casefold(), units, lang))
+
+
+def _cache_get(key: str) -> tuple[dict, int] | None:
+    entry = _weather_cache.get(key)
+    if not entry:
+        return None
+
+    expires_at, data = entry
+    now = time.monotonic()
+    if expires_at <= now:
+        _weather_cache.pop(key, None)
+        return None
+
+    _weather_cache.move_to_end(key)
+    age = max(0, CACHE_TTL_SECONDS - int(expires_at - now))
+    return data, age
+
+
+def _cache_put(key: str, data: dict) -> None:
+    if CACHE_TTL_SECONDS <= 0:
+        return
+
+    _weather_cache[key] = (time.monotonic() + CACHE_TTL_SECONDS, data)
+    _weather_cache.move_to_end(key)
+    while len(_weather_cache) > CACHE_MAX_ENTRIES:
+        evicted_key, _ = _weather_cache.popitem(last=False)
+        lock = _query_locks.get(evicted_key)
+        if lock is not None and not lock.locked():
+            _query_locks.pop(evicted_key, None)
+
+
+def _weather_payload(data: dict) -> dict:
+    return {
+        "name": data.get("name"),
+        "sys": data.get("sys"),
+        "main": data.get("main"),
+        "wind": data.get("wind"),
+        "weather": data.get("weather"),
+    }
 
 
 """
@@ -309,6 +371,7 @@ async def search(request: Request, q: str, limit: int = 25):
 @app.get("/weather")
 async def weather(
     request: Request,
+    response: Response,
     city: str | None = None,
     postal: str | None = None,
     country: str = "us",
@@ -357,65 +420,63 @@ async def weather(
     # Enactment of rate limit on current user, prevents spamming
     _enforce_rate_limit(rate_key, OPENWEATHER_RATE_LIMIT_PER_MIN)
 
-    # Count only authenticated, valid requests against the global allowance.
-    _enforce_daily_limit()
+    key = _cache_key(city=city, postal=postal, country=country, units=units, lang=lang)
+    cached = _cache_get(key)
+    if cached:
+        data, age = cached
+        response.headers["X-Weather-Cache"] = "HIT"
+        response.headers["X-Weather-Cache-Age"] = str(age)
+        return _weather_payload(data)
 
-    # Parameters for OpenWeather API request
-    params = {
-        "appid": OPENWEATHER_API_KEY,
-        "units": units,
-        "lang": lang,
-    }
+    lock = _query_locks.setdefault(key, asyncio.Lock())
+    async with lock:
+        # Another request might have filled the cache while this one waited.
+        cached = _cache_get(key)
+        if cached:
+            data, age = cached
+            response.headers["X-Weather-Cache"] = "HIT"
+            response.headers["X-Weather-Cache-Age"] = str(age)
+            return _weather_payload(data)
 
-    # Uses city search if provided
-    if city:
-        params["q"] = f"{city},{country}"
+        # Only real upstream calls consume the protective daily allowance.
+        _enforce_daily_limit()
 
-    # Uses postal search if provided
-    elif postal:
-        params["zip"] = f"{postal},{country}"
-    
-    
-    # Calls OpenWeatherMap with an async HTTP client with an 8-second timeout.
-    try:
-        async with httpx.AsyncClient(timeout=8) as client_http:
-            response = await client_http.get(OPENWEATHER_URL, params=params)
-    except httpx.TimeoutException as exc:
-        raise HTTPException(status_code=504, detail="Weather provider timed out") from exc
-    except httpx.HTTPError as exc:
-        raise HTTPException(status_code=502, detail="Weather provider unavailable") from exc
+        params = {
+            "appid": OPENWEATHER_API_KEY,
+            "units": units,
+            "lang": lang,
+        }
+        if city:
+            params["q"] = f"{city},{country}"
+        else:
+            params["zip"] = f"{postal},{country}"
 
-    # Checks OpenWeatherMap Call response code for failure codes.
-    if response.status_code != 200:
         try:
-            detail = response.json()
-        except Exception:
-            detail = response.text
+            async with httpx.AsyncClient(timeout=8) as client_http:
+                upstream_response = await client_http.get(OPENWEATHER_URL, params=params)
+        except httpx.TimeoutException as exc:
+            raise HTTPException(status_code=504, detail="Weather provider timed out") from exc
+        except httpx.HTTPError as exc:
+            raise HTTPException(status_code=502, detail="Weather provider unavailable") from exc
 
-        raise HTTPException(
-            status_code=response.status_code,
-            detail=detail
+        if upstream_response.status_code != 200:
+            try:
+                detail = upstream_response.json()
+            except Exception:
+                detail = upstream_response.text
+            raise HTTPException(status_code=upstream_response.status_code, detail=detail)
+
+        data = upstream_response.json()
+        _cache_put(key, data)
+        _db_log(
+            query_type="city" if city else "postal",
+            city=city or None,
+            postal=postal or None,
+            country=country,
+            units=units,
+            data=data,
         )
 
-    # Parses response body into a dict/list structure.
-    data = response.json()
-
-    # Logs the successful call into SQLite history.
-    _db_log(
-        query_type="city" if city else "postal",
-        city=city or None,
-        postal=postal or None,
-        country=country,
-        units=units,
-        data=data,
-    )
-
-    # Returns a dict with all nessecary fields for client.
-    # FastAPI serializes this dict to a JSON for HTTP response automatically.
-    return {
-        "name": data.get("name"),
-        "sys": data.get("sys"),
-        "main": data.get("main"),
-        "wind": data.get("wind"),
-        "weather": data.get("weather"),
-    }
+        response.headers["X-Weather-Cache"] = "MISS"
+        response.headers["X-Weather-Cache-Age"] = "0"
+        return _weather_payload(data)

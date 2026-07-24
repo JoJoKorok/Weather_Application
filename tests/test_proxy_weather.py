@@ -18,6 +18,8 @@ class DummyHTTPXResponse:
 
 class DummyAsyncClient:
     # Replaces httpx.AsyncClient so we never hit OpenWeather during tests.
+    calls = 0
+
     def __init__(self, timeout=8):
         self.timeout = timeout
 
@@ -28,6 +30,7 @@ class DummyAsyncClient:
         return False
 
     async def get(self, url, params=None):
+        type(self).calls += 1
         data = {
             "name": "London",
             "sys": {"country": "GB"},
@@ -41,10 +44,15 @@ class DummyAsyncClient:
 @pytest.fixture(autouse=True)
 def reset_proxy_counters(monkeypatch):
     server._hits.clear()
+    server._weather_cache.clear()
+    server._query_locks.clear()
+    DummyAsyncClient.calls = 0
     monkeypatch.setattr(server, "_usage_day", None)
     monkeypatch.setattr(server, "_usage_count", 0)
     monkeypatch.setattr(server, "DAILY_LIMIT", 1000)
     monkeypatch.setattr(server, "OPENWEATHER_RATE_LIMIT_PER_MIN", 60)
+    monkeypatch.setattr(server, "CACHE_TTL_SECONDS", 600)
+    monkeypatch.setattr(server, "CACHE_MAX_ENTRIES", 500)
 
 
 def test_proxy_root_ok():
@@ -96,6 +104,36 @@ def test_proxy_weather_success(monkeypatch):
     assert "main" in body
     assert "wind" in body
     assert "weather" in body
+    assert r.headers["X-Weather-Cache"] == "MISS"
+
+
+def test_proxy_caches_normalized_duplicate_queries(monkeypatch):
+    monkeypatch.setattr(server, "OPENWEATHER_API_KEY", "dummykey")
+    monkeypatch.setattr(server, "PROXY_TOKENS", set())
+    monkeypatch.setattr(server.httpx, "AsyncClient", DummyAsyncClient)
+
+    client = TestClient(proxy_app)
+    first = client.get("/weather?city=London&country=gb")
+    second = client.get("/weather?city=london&country=GB")
+
+    assert first.status_code == 200
+    assert first.headers["X-Weather-Cache"] == "MISS"
+    assert second.status_code == 200
+    assert second.headers["X-Weather-Cache"] == "HIT"
+    assert DummyAsyncClient.calls == 1
+    assert server._usage_count == 1
+
+
+def test_proxy_cache_can_be_disabled(monkeypatch):
+    monkeypatch.setattr(server, "OPENWEATHER_API_KEY", "dummykey")
+    monkeypatch.setattr(server, "PROXY_TOKENS", set())
+    monkeypatch.setattr(server, "CACHE_TTL_SECONDS", 0)
+    monkeypatch.setattr(server.httpx, "AsyncClient", DummyAsyncClient)
+
+    client = TestClient(proxy_app)
+    assert client.get("/weather?city=London&country=gb").status_code == 200
+    assert client.get("/weather?city=London&country=gb").status_code == 200
+    assert DummyAsyncClient.calls == 2
 
 
 def test_proxy_rejects_ambiguous_or_invalid_queries(monkeypatch):
